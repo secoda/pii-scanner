@@ -1,0 +1,14 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Secoda PII scanner local state and generated reports
+.secoda_pii_scan_state.json
+secoda_pii_report_*.csv
+secoda_pii_report_*.json

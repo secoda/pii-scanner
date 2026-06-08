@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Interactive Secoda PII scanner.
+Interactive Secoda data compliance scanner.
 
 What it does:
 1) Pulls databases, schemas, tables, and columns from the Secoda catalog API.
 2) Fetches table previews and extracts sample values for each column.
-3) Asks Gemini to classify unmarked columns as PII or not PII.
+3) Asks Gemini to classify unmarked columns for PII/PCI/PHI risk.
 4) Writes JSON/CSV reports with a review_pii column for human review.
 5) Pauses until the CSV is reviewed, then marks reviewed PII columns in Secoda.
 """
@@ -33,6 +33,8 @@ MAX_TABLES_PER_AI_PROMPT = 15
 DEFAULT_PAGE_SIZE = 1000
 DEFAULT_GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_SCAN_FOR = "pii"
+SUPPORTED_SCAN_TYPES = ("PII", "PCI", "PHI")
 
 # Optional local testing overrides. Leave these blank for interactive prompts.
 # Do not commit real API keys.
@@ -185,10 +187,43 @@ def prompt_optional_csv(message: str) -> set[str]:
     return csv_filter_values(raw)
 
 
+def prompt_scan_types(default_value: str = DEFAULT_SCAN_FOR) -> list[str]:
+    raw = input(
+        "Compliance categories to scan "
+        f"(comma separated: {', '.join(SUPPORTED_SCAN_TYPES)}) [{default_value}]: "
+    ).strip()
+    selected = raw or default_value
+    return parse_scan_types(selected)
+
+
 def csv_filter_values(raw: str) -> set[str]:
     if not raw:
         return set()
     return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def parse_scan_types(raw: str) -> list[str]:
+    values = [item.strip().upper() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError(
+            f"At least one scan category is required: {', '.join(SUPPORTED_SCAN_TYPES)}"
+        )
+    deduped = sorted(set(values))
+    unsupported = [value for value in deduped if value not in SUPPORTED_SCAN_TYPES]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported scan category: {', '.join(unsupported)}. "
+            f"Supported values: {', '.join(SUPPORTED_SCAN_TYPES)}"
+        )
+    return deduped
+
+
+def parse_scan_types_loose(raw: str) -> list[str]:
+    return [
+        item.strip().upper()
+        for item in raw.split(",")
+        if item.strip() and item.strip().upper() in SUPPORTED_SCAN_TYPES
+    ]
 
 
 def prompt_yes_no(message: str, *, default_yes: bool = True) -> bool:
@@ -936,10 +971,29 @@ def build_table_ai_prompt(
     table_input: dict[str, Any],
     column_inputs: list[dict[str, Any]],
     preview: dict[str, Any],
+    scan_types: list[str],
 ) -> str:
+    scan_scope_instructions = {
+        "PII": (
+            "PII: personally identifiable information, such as names, personal emails, "
+            "phone numbers, home addresses, government IDs, precise geolocation, or "
+            "persistent user identifiers tied to a natural person."
+        ),
+        "PCI": (
+            "PCI: payment card information, such as PAN/card numbers, CVV/CVC, card "
+            "expiration dates, cardholder names tied to card data, or other card "
+            "authentication/payment instrument data."
+        ),
+        "PHI": (
+            "PHI: protected health information, such as medical record numbers, member "
+            "IDs in healthcare context, diagnosis/treatment details, lab results, or "
+            "health information linked to a person."
+        ),
+    }
     payload = {
         "table": table_input,
         "columns_to_evaluate": column_inputs,
+        "scan_categories": scan_types,
         "preview": {
             "columns": preview.get("columns", []),
             "column_types": preview.get("column_types", {}),
@@ -948,19 +1002,23 @@ def build_table_ai_prompt(
         },
     }
     payload_json = json.dumps(payload, indent=2)
+    selected_instructions = "\n".join(
+        f"- {scan_scope_instructions[scan_type]}" for scan_type in scan_types
+    )
     return (
-        "You are performing a PII detection audit in Secoda.\n\n"
+        "You are a general data compliance expert.\n"
+        "You are not performing a PII detection audit in Secoda.\n\n"
         "Review one table at a time using the table location, column metadata, and preview rows. "
-        "Evaluate only the columns listed in `columns_to_evaluate`. Mark a column as PII when it contains, or is very likely to contain, "
-        "personally identifiable information such as names, emails, phone numbers, addresses, "
-        "government identifiers, payment identifiers, precise locations, user IDs tied to people, "
-        "or other sensitive personal data.\n\n"
+        "Evaluate only the columns listed in `columns_to_evaluate` and only for the categories in `scan_categories`.\n\n"
+        "Category definitions:\n"
+        f"{selected_instructions}\n\n"
         "Return ONLY valid JSON (no markdown) with this exact shape:\n"
         "{\n"
         '  "decisions": [\n'
         "    {\n"
         '      "column_id": "string",\n'
-        '      "is_pii": true,\n'
+        '      "is_sensitive": true,\n'
+        '      "matched_categories": ["PII"],\n'
         '      "confidence": "high|medium|low",\n'
         '      "reason": "string",\n'
         '      "sample_evidence": "string"\n'
@@ -976,9 +1034,11 @@ def normalize_column_decisions(
     raw_decisions: Any,
     batch_inputs: list[dict[str, Any]],
     source_id: str,
+    scan_types: list[str],
 ) -> dict[str, dict[str, str]]:
     expected_ids = {str(item["column_id"]) for item in batch_inputs}
     decisions: dict[str, dict[str, str]] = {}
+    selected_types = set(scan_types)
     if not isinstance(raw_decisions, list):
         raw_decisions = []
 
@@ -988,16 +1048,36 @@ def normalize_column_decisions(
         column_id = str(decision.get("column_id", "")).strip()
         if column_id not in expected_ids or column_id in decisions:
             continue
-        is_pii = to_bool(decision.get("is_pii"))
+        matched_categories_raw = decision.get("matched_categories", [])
+        if isinstance(matched_categories_raw, list):
+            parsed_categories = [
+                str(item).strip().upper()
+                for item in matched_categories_raw
+                if str(item).strip()
+            ]
+        elif isinstance(matched_categories_raw, str):
+            parsed_categories = parse_scan_types_loose(matched_categories_raw)
+        else:
+            parsed_categories = []
+        matched_categories = sorted(
+            {category for category in parsed_categories if category in selected_types}
+        )
+        is_sensitive = to_bool(decision.get("is_sensitive")) or bool(matched_categories)
+        if to_bool(decision.get("is_pii")) and "PII" in selected_types:
+            is_sensitive = True
+            if "PII" not in matched_categories:
+                matched_categories.append("PII")
+                matched_categories = sorted(set(matched_categories))
         decisions[column_id] = {
-            "is_pii": csv_bool(is_pii),
-            "review_pii": csv_bool(is_pii),
+            "is_pii": csv_bool(is_sensitive),
+            "review_pii": csv_bool(is_sensitive),
             "confidence": str(decision.get("confidence", "unknown")).strip().lower()
             or "unknown",
             "reason": str(decision.get("reason", "")).strip(),
             "sample_evidence": truncate_text(
                 decision.get("sample_evidence", ""), max_length=1000
             ),
+            "matched_categories": ",".join(matched_categories),
             "source_prompt_id": source_id,
         }
 
@@ -1010,6 +1090,7 @@ def normalize_column_decisions(
                 "confidence": "unknown",
                 "reason": "AI response did not include this column.",
                 "sample_evidence": "",
+                "matched_categories": "",
                 "source_prompt_id": source_id,
             }
 
@@ -1022,6 +1103,7 @@ def scan_table_with_ai(
     table_input: dict[str, Any],
     column_inputs: list[dict[str, Any]],
     preview: dict[str, Any],
+    scan_types: list[str],
 ) -> dict[str, dict[str, str]]:
     if not column_inputs:
         return {}
@@ -1036,6 +1118,7 @@ def scan_table_with_ai(
             table_input=table_input,
             column_inputs=column_inputs,
             preview=preview,
+            scan_types=scan_types,
         )
     )
     print("done.")
@@ -1045,11 +1128,15 @@ def scan_table_with_ai(
         parsed.get("decisions"),
         column_inputs,
         source_id,
+        scan_types,
     )
     flagged_count = sum(
         1 for decision in decisions.values() if decision["is_pii"] == "TRUE"
     )
-    print(f"    Flagged {flagged_count} likely PII column(s) for this table.")
+    print(
+        f"    Flagged {flagged_count} likely matching column(s) for this table "
+        f"({', '.join(scan_types)})."
+    )
     time.sleep(0.35)
     return decisions
 
@@ -1058,6 +1145,7 @@ def build_review_rows(
     secoda_client: SecodaClient,
     gemini_client: GeminiClient,
     inventory: list[TableInventory],
+    scan_types: list[str],
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
 
@@ -1097,6 +1185,7 @@ def build_review_rows(
                 if column.pii
                 else "",
                 "sample_evidence": sample_text,
+                "matched_categories": "PII" if column.pii else "",
                 "preview_error": preview_error,
                 "source_prompt_id": "",
                 "secoda_url": resource_string(column.raw, "url"),
@@ -1126,6 +1215,7 @@ def build_review_rows(
                 table_input=table_input,
                 column_inputs=column_inputs,
                 preview=preview,
+                scan_types=scan_types,
             )
             for row in table_rows:
                 decision = decisions.get(row["secoda_column_id"])
@@ -1167,6 +1257,7 @@ def write_review_reports(rows: list[dict[str, str]]) -> tuple[Path, Path]:
         "confidence",
         "reason",
         "sample_evidence",
+        "matched_categories",
         "preview_error",
         "source_prompt_id",
         "secoda_url",
@@ -1288,6 +1379,7 @@ def run_one_scan_cycle(
     database_filter: set[str],
     schema_filter: set[str],
     single_table: str | None,
+    scan_types: list[str],
 ) -> int:
     print(
         "Applying filters "
@@ -1296,6 +1388,7 @@ def run_one_scan_cycle(
     if single_table is not None:
         label = single_table or "first matching table"
         print(f"Single-table test mode enabled ({label}).")
+    print(f"Compliance categories selected: {', '.join(scan_types)}")
 
     inventory = discover_table_inventory(
         client,
@@ -1310,13 +1403,13 @@ def run_one_scan_cycle(
     column_count = sum(len(item.columns) for item in inventory)
     print(f"\nDiscovered {len(inventory)} table(s) and {column_count} column(s).")
 
-    rows = build_review_rows(client, gemini_client, inventory)
+    rows = build_review_rows(client, gemini_client, inventory, scan_types)
 
     json_path, csv_path = write_review_reports(rows)
-    likely_pii_count = sum(1 for row in rows if to_bool(row.get("is_pii")))
+    likely_sensitive_count = sum(1 for row in rows if to_bool(row.get("is_pii")))
 
     print("\nScan complete.")
-    print(f"Likely PII columns: {likely_pii_count}")
+    print(f"Likely matching columns ({', '.join(scan_types)}): {likely_sensitive_count}")
     print(f"JSON report: {json_path.resolve()}")
     print(f"CSV report:  {csv_path.resolve()}")
     print("\nOpen the CSV in Excel, review the review_pii column, then save the CSV.")
@@ -1327,7 +1420,7 @@ def run_one_scan_cycle(
         updated_count = update_reviewed_pii_columns(client, csv_path)
         print(f"Updated {updated_count} newly marked PII column(s).")
 
-    return likely_pii_count
+    return likely_sensitive_count
 
 
 def print_response_summary(label: str, response: dict[str, Any]) -> None:
@@ -1402,7 +1495,16 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Scan Secoda columns for possible PII."
+        description="Scan Secoda columns for possible PII/PCI/PHI."
+    )
+    parser.add_argument(
+        "--scan-for",
+        default=None,
+        help=(
+            "Compliance categories to scan (comma separated). "
+            f"Supported values: {', '.join(SUPPORTED_SCAN_TYPES)}. "
+            f"Default: {DEFAULT_SCAN_FOR}."
+        ),
     )
     parser.add_argument(
         "--debug-columns",
@@ -1429,7 +1531,7 @@ def main() -> int:
     print("Secoda PII Scanner")
     print("==================")
     print(
-        "This tool scans catalog columns, asks Gemini to classify sampled values, and exports a reviewable CSV."
+        "This tool scans catalog columns, asks Gemini to classify sampled values for selected compliance categories, and exports a reviewable CSV."
     )
 
     base_url = prompt_input("Secoda API base URL", default=DEFAULT_BASE_URL)
@@ -1462,6 +1564,19 @@ def main() -> int:
     else:
         schema_filter = prompt_optional_csv("Schema(s) to scan")
 
+    if args.scan_for is None:
+        try:
+            scan_types = prompt_scan_types(default_value=DEFAULT_SCAN_FOR)
+        except ValueError as exc:
+            print(f"\nError: {exc}")
+            return 1
+    else:
+        try:
+            scan_types = parse_scan_types(args.scan_for)
+        except ValueError as exc:
+            print(f"\nError: {exc}")
+            return 1
+
     single_table = args.single_table
     if HARDCODED_SINGLE_TABLE.strip():
         single_table = HARDCODED_SINGLE_TABLE.strip()
@@ -1492,6 +1607,7 @@ def main() -> int:
             database_filter=database_filter,
             schema_filter=schema_filter,
             single_table=single_table,
+            scan_types=scan_types,
         )
         return 0
     except KeyboardInterrupt:

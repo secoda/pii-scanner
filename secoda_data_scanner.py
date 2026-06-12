@@ -518,8 +518,7 @@ class SecodaClient:
     def get_table_preview(self, table_id: str) -> dict[str, Any]:
         return self._request("GET", f"/resource/preview_v2/table/{table_id}/")
 
-    def bulk_update_pii(self, column_ids: list[str]) -> list[Any]:
-        payload = [{"id": column_id, "data": {"pii": True}} for column_id in column_ids]
+    def bulk_update_resources(self, payload: list[dict[str, Any]]) -> list[Any]:
         response = self._request("POST", "/resource/all/bulk_update/", payload=payload)
         if isinstance(response, list):
             return response
@@ -799,6 +798,60 @@ def truncate_text(value: Any, max_length: int = 250) -> str:
     if len(text) <= max_length:
         return text
     return f"{text[: max_length - 3]}..."
+
+
+def parse_resource_tags(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parse_resource_tags(parsed)
+        except json.JSONDecodeError:
+            pass
+        return [text]
+
+    tags: list[str] = []
+    if isinstance(value, dict):
+        for key in ("title", "name", "label", "value", "tag"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                tags.append(candidate.strip())
+                break
+        return tags
+
+    if isinstance(value, list):
+        for item in value:
+            tags.extend(parse_resource_tags(item))
+
+    return tags
+
+
+def resource_tags(resource: dict[str, Any]) -> list[str]:
+    for key in ("tags", "resource_tags", "labels"):
+        tags = parse_resource_tags(resource.get(key))
+        if tags:
+            return sorted(set(tags), key=str.lower)
+    return []
+
+
+def merge_tags(existing_tags: list[str], tag_to_add: str | None) -> list[str]:
+    merged: dict[str, str] = {}
+    for tag in existing_tags:
+        normalized = canonical_name(tag)
+        if normalized:
+            merged[normalized.lower()] = normalized
+
+    if tag_to_add:
+        normalized = canonical_name(tag_to_add)
+        if normalized:
+            merged[normalized.lower()] = normalized
+
+    return sorted(merged.values(), key=str.lower)
 
 
 def column_data_type(column: CatalogResource) -> str:
@@ -1188,6 +1241,7 @@ def build_review_rows(
                 "matched_categories": "PII" if column.pii else "",
                 "preview_error": preview_error,
                 "source_prompt_id": "",
+                "existing_tags": json.dumps(resource_tags(column.raw), separators=(",", ":")),
                 "secoda_url": resource_string(column.raw, "url"),
             }
             table_rows.append(row)
@@ -1260,6 +1314,7 @@ def write_review_reports(rows: list[dict[str, str]]) -> tuple[Path, Path]:
         "matched_categories",
         "preview_error",
         "source_prompt_id",
+        "existing_tags",
         "secoda_url",
     ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -1271,10 +1326,16 @@ def write_review_reports(rows: list[dict[str, str]]) -> tuple[Path, Path]:
     return json_path, csv_path
 
 
-def reviewed_pii_column_ids(csv_path: Path) -> list[str]:
-    column_ids: list[str] = []
+def reviewed_pii_updates(
+    csv_path: Path, update_tag: str | None = None
+) -> tuple[list[dict[str, Any]], bool]:
+    updates: list[dict[str, Any]] = []
+    requested_tag = canonical_name(update_tag or "")
     with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
+        has_existing_tags_column = bool(reader.fieldnames) and "existing_tags" in set(
+            reader.fieldnames or []
+        )
         for row in reader:
             column_id = str(row.get("secoda_column_id", "")).strip()
             if (
@@ -1282,22 +1343,47 @@ def reviewed_pii_column_ids(csv_path: Path) -> list[str]:
                 and to_bool(row.get("review_pii"))
                 and not to_bool(row.get("already_pii"))
             ):
-                column_ids.append(column_id)
-    return sorted(set(column_ids))
+                payload_data: dict[str, Any] = {"pii": True}
+                if requested_tag and has_existing_tags_column:
+                    payload_data["tags"] = merge_tags(
+                        parse_resource_tags(row.get("existing_tags")),
+                        requested_tag,
+                    )
+                updates.append({"id": column_id, "data": payload_data})
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for update in updates:
+        deduped[str(update["id"])] = update
+    return [deduped[key] for key in sorted(deduped)], has_existing_tags_column
 
 
-def update_reviewed_pii_columns(client: SecodaClient, csv_path: Path) -> int:
-    column_ids = reviewed_pii_column_ids(csv_path)
-    if not column_ids:
+def update_reviewed_pii_columns(
+    client: SecodaClient, csv_path: Path, update_tag: str | None = None
+) -> int:
+    updates, has_existing_tags_column = reviewed_pii_updates(csv_path, update_tag)
+    if not updates:
         print("No newly reviewed PII columns found in the CSV.")
         return 0
 
-    print(f"\nUpdating {len(column_ids)} column(s) as PII in Secoda...")
+    requested_tag = canonical_name(update_tag or "")
+    if requested_tag and not has_existing_tags_column:
+        print(
+            "Warning: CSV does not include existing_tags. "
+            "Skipping tag updates to avoid overwriting existing tags. "
+            "Re-run scan with this script version to enable safe tag append."
+        )
+        for update in updates:
+            update["data"].pop("tags", None)
+
+    print(f"\nUpdating {len(updates)} column(s) as PII in Secoda...")
+    if requested_tag and has_existing_tags_column:
+        print(f"Appending tag to updated resources: {requested_tag}")
+
     updated_count = 0
-    for batch in [column_ids[i : i + 100] for i in range(0, len(column_ids), 100)]:
-        client.bulk_update_pii(batch)
+    for batch in [updates[i : i + 100] for i in range(0, len(updates), 100)]:
+        client.bulk_update_resources(batch)
         updated_count += len(batch)
-        print(f"  Updated {updated_count}/{len(column_ids)} column(s).")
+        print(f"  Updated {updated_count}/{len(updates)} column(s).")
         time.sleep(0.25)
     return updated_count
 
@@ -1380,6 +1466,7 @@ def run_one_scan_cycle(
     schema_filter: set[str],
     single_table: str | None,
     scan_types: list[str],
+    update_tag: str | None,
 ) -> int:
     print(
         "Applying filters "
@@ -1417,7 +1504,11 @@ def run_one_scan_cycle(
         "Continue and update reviewed PII columns now?", default_yes=False
     ):
         input("Press Enter after you have saved the reviewed CSV...")
-        updated_count = update_reviewed_pii_columns(client, csv_path)
+        updated_count = update_reviewed_pii_columns(
+            client,
+            csv_path,
+            update_tag=update_tag,
+        )
         print(f"Updated {updated_count} newly marked PII column(s).")
 
     return likely_sensitive_count
@@ -1526,6 +1617,14 @@ def main() -> int:
             "or omit the value to scan the first matching table."
         ),
     )
+    parser.add_argument(
+        "--update-tag",
+        default=None,
+        help=(
+            "Optional tag to append to each newly updated resource, "
+            'for example: "AI Generated".'
+        ),
+    )
     args, _ = parser.parse_known_args()
 
     print("Secoda PII Scanner")
@@ -1545,7 +1644,11 @@ def main() -> int:
     client = SecodaClient(base_url=base_url, api_key=api_key)
     if args.review_csv:
         try:
-            updated_count = update_reviewed_pii_columns(client, args.review_csv)
+            updated_count = update_reviewed_pii_columns(
+                client,
+                args.review_csv,
+                update_tag=args.update_tag,
+            )
             print(f"Updated {updated_count} newly marked PII column(s).")
             return 0
         except SecodaApiError as exc:
@@ -1608,6 +1711,7 @@ def main() -> int:
             schema_filter=schema_filter,
             single_table=single_table,
             scan_types=scan_types,
+            update_tag=args.update_tag,
         )
         return 0
     except KeyboardInterrupt:

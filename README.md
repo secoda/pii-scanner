@@ -24,7 +24,7 @@ The script uses only Python standard-library modules, so no package installation
 Run the scanner interactively:
 
 ```bash
-python3 secoda_pii_scanner.py
+python3 secoda_data_scanner.py
 ```
 
 You will be prompted for:
@@ -41,13 +41,13 @@ You will be prompted for:
 Scan a named table:
 
 ```bash
-python3 secoda_pii_scanner.py --single-table my_table_name
+python3 secoda_data_scanner.py --single-table my_table_name
 ```
 
 Scan the first matching table only:
 
 ```bash
-python3 secoda_pii_scanner.py --single-table
+python3 secoda_data_scanner.py --single-table
 ```
 
 ### Debug column discovery
@@ -55,7 +55,7 @@ python3 secoda_pii_scanner.py --single-table
 Inspect raw column fields and filter matching without running Gemini classification:
 
 ```bash
-python3 secoda_pii_scanner.py --debug-columns
+python3 secoda_data_scanner.py --debug-columns
 ```
 
 ### Apply updates from a reviewed CSV
@@ -63,7 +63,13 @@ python3 secoda_pii_scanner.py --debug-columns
 After reviewing an exported CSV and setting `review_pii` values, apply updates without rescanning:
 
 ```bash
-python3 secoda_pii_scanner.py --review-csv pii_review_YYYYMMDD_HHMMSS.csv
+python3 secoda_data_scanner.py --review-csv pii_review_YYYYMMDD_HHMMSS.csv
+```
+
+Append a tag to each newly updated resource while preserving existing tags:
+
+```bash
+python3 secoda_data_scanner.py --single-table my_table_name --update-tag "AI Generated"
 ```
 
 ## Review workflow
@@ -78,7 +84,7 @@ python3 secoda_pii_scanner.py --review-csv pii_review_YYYYMMDD_HHMMSS.csv
 
 - Do **not** commit Secoda or Gemini API keys.
 - Prefer entering keys interactively when prompted.
-- Leave the `HARDCODED_*` constants in `secoda_pii_scanner.py` empty unless you are using a private, local-only copy.
+- Leave the `HARDCODED_*` constants in `secoda_data_scanner.py` empty unless you are using a private, local-only copy.
 - Review generated CSV and JSON reports before sharing them; sampled data and column evidence may contain sensitive information.
 
 ## Generated files

@@ -72,6 +72,14 @@ Append a tag to each newly updated resource while preserving existing tags:
 python3 secoda_data_scanner.py --single-table my_table_name --update-tag "AI Generated"
 ```
 
+If `--update-tag` is omitted, the script prompts for an optional tag during setup.
+
+Skip manual review and apply updates immediately:
+
+```bash
+python3 secoda_data_scanner.py --single-table my_table_name --skip-review
+```
+
 ## Review workflow
 
 1. Run the scanner.

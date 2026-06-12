@@ -19,6 +19,7 @@ import json
 import re
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -185,6 +186,14 @@ def prompt_input(
 def prompt_optional_csv(message: str) -> set[str]:
     raw = input(f"{message} (comma separated, blank for all): ").strip()
     return csv_filter_values(raw)
+
+
+def prompt_optional_input(message: str, *, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    raw = input(f"{message}{suffix}: ").strip()
+    if raw:
+        return raw
+    return default
 
 
 def prompt_scan_types(default_value: str = DEFAULT_SCAN_FOR) -> list[str]:
@@ -518,6 +527,9 @@ class SecodaClient:
     def get_table_preview(self, table_id: str) -> dict[str, Any]:
         return self._request("GET", f"/resource/preview_v2/table/{table_id}/")
 
+    def get_resource(self, resource_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/resource/all/{resource_id}")
+
     def bulk_update_resources(self, payload: list[dict[str, Any]]) -> list[Any]:
         response = self._request("POST", "/resource/all/bulk_update/", payload=payload)
         if isinstance(response, list):
@@ -525,6 +537,45 @@ class SecodaClient:
         if isinstance(response.get("results"), list):
             return response["results"]
         return [response]
+
+    def list_tags(self) -> list[dict[str, Any]]:
+        page = 1
+        tags: list[dict[str, Any]] = []
+        while True:
+            response = self._request(
+                "GET",
+                "/tag",
+                params={"page": page, "page_size": DEFAULT_PAGE_SIZE},
+            )
+            results = response.get("results", [])
+            if not isinstance(results, list):
+                raise SecodaApiError("Unexpected tags response: 'results' is not a list.")
+            tags.extend([tag for tag in results if isinstance(tag, dict)])
+            next_page = response_next_page(response)
+            if next_page is None:
+                break
+            page = next_page
+        return tags
+
+    def create_tag(
+        self,
+        *,
+        name: str,
+        color: str = "#4299E1",
+        description: str = "Created by Secoda PII Scanner",
+    ) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            "/tag",
+            payload={
+                "name": name,
+                "color": color,
+                "description": description,
+            },
+        )
+        if not isinstance(response, dict):
+            raise SecodaApiError("Unexpected create-tag response shape.")
+        return response
 
 
 class GeminiClient:
@@ -800,7 +851,17 @@ def truncate_text(value: Any, max_length: int = 250) -> str:
     return f"{text[: max_length - 3]}..."
 
 
-def parse_resource_tags(value: Any) -> list[str]:
+def parse_tag_ids(value: Any) -> list[str]:
+    def normalize_tag_id(tag_value: Any) -> str:
+        if isinstance(tag_value, dict):
+            tag_value = tag_value.get("id")
+        if tag_value is None:
+            return ""
+        try:
+            return str(uuid.UUID(str(tag_value)))
+        except (ValueError, TypeError, AttributeError):
+            return ""
+
     if value is None:
         return []
     if isinstance(value, str):
@@ -809,49 +870,54 @@ def parse_resource_tags(value: Any) -> list[str]:
             return []
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return parse_resource_tags(parsed)
+            return parse_tag_ids(parsed)
         except json.JSONDecodeError:
-            pass
-        return [text]
+            normalized = normalize_tag_id(text)
+            return [normalized] if normalized else []
+    if not isinstance(value, list):
+        return []
 
-    tags: list[str] = []
-    if isinstance(value, dict):
-        for key in ("title", "name", "label", "value", "tag"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                tags.append(candidate.strip())
-                break
-        return tags
-
-    if isinstance(value, list):
-        for item in value:
-            tags.extend(parse_resource_tags(item))
-
-    return tags
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in value:
+        normalized = normalize_tag_id(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            cleaned.append(normalized)
+    return cleaned
 
 
-def resource_tags(resource: dict[str, Any]) -> list[str]:
-    for key in ("tags", "resource_tags", "labels"):
-        tags = parse_resource_tags(resource.get(key))
-        if tags:
-            return sorted(set(tags), key=str.lower)
-    return []
+def append_tag_id(existing_tag_ids: list[str], tag_id_to_add: str | None) -> list[str]:
+    if not tag_id_to_add:
+        return existing_tag_ids
+    merged = list(existing_tag_ids)
+    if tag_id_to_add not in merged:
+        merged.append(tag_id_to_add)
+    return merged
 
 
-def merge_tags(existing_tags: list[str], tag_to_add: str | None) -> list[str]:
-    merged: dict[str, str] = {}
-    for tag in existing_tags:
-        normalized = canonical_name(tag)
-        if normalized:
-            merged[normalized.lower()] = normalized
+def resolve_or_create_tag_id(client: SecodaClient, tag_name: str) -> tuple[str, bool]:
+    normalized_name = canonical_name(tag_name)
+    if not normalized_name:
+        return "", False
 
-    if tag_to_add:
-        normalized = canonical_name(tag_to_add)
-        if normalized:
-            merged[normalized.lower()] = normalized
+    for tag in client.list_tags():
+        existing_name = canonical_name(str(tag.get("name", "")))
+        if existing_name.lower() == normalized_name.lower():
+            tag_id = str(tag.get("id", "")).strip()
+            try:
+                return str(uuid.UUID(tag_id)), False
+            except (ValueError, TypeError, AttributeError):
+                continue
 
-    return sorted(merged.values(), key=str.lower)
+    created = client.create_tag(name=normalized_name)
+    created_tag_id = str(created.get("id", "")).strip()
+    try:
+        return str(uuid.UUID(created_tag_id)), True
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise SecodaApiError(
+            f"Created tag '{normalized_name}' but response did not include a valid ID."
+        ) from exc
 
 
 def column_data_type(column: CatalogResource) -> str:
@@ -1241,7 +1307,7 @@ def build_review_rows(
                 "matched_categories": "PII" if column.pii else "",
                 "preview_error": preview_error,
                 "source_prompt_id": "",
-                "existing_tags": json.dumps(resource_tags(column.raw), separators=(",", ":")),
+                "existing_tag_ids": json.dumps(parse_tag_ids(column.raw.get("tags"))),
                 "secoda_url": resource_string(column.raw, "url"),
             }
             table_rows.append(row)
@@ -1314,7 +1380,7 @@ def write_review_reports(rows: list[dict[str, str]]) -> tuple[Path, Path]:
         "matched_categories",
         "preview_error",
         "source_prompt_id",
-        "existing_tags",
+        "existing_tag_ids",
         "secoda_url",
     ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -1327,15 +1393,14 @@ def write_review_reports(rows: list[dict[str, str]]) -> tuple[Path, Path]:
 
 
 def reviewed_pii_updates(
-    csv_path: Path, update_tag: str | None = None
+    csv_path: Path, update_tag_id: str | None = None
 ) -> tuple[list[dict[str, Any]], bool]:
     updates: list[dict[str, Any]] = []
-    requested_tag = canonical_name(update_tag or "")
+    requested_tag_id = (update_tag_id or "").strip()
     with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        has_existing_tags_column = bool(reader.fieldnames) and "existing_tags" in set(
-            reader.fieldnames or []
-        )
+        fieldnames = set(reader.fieldnames or [])
+        has_existing_tags_column = "existing_tag_ids" in fieldnames or "existing_tags" in fieldnames
         for row in reader:
             column_id = str(row.get("secoda_column_id", "")).strip()
             if (
@@ -1344,10 +1409,13 @@ def reviewed_pii_updates(
                 and not to_bool(row.get("already_pii"))
             ):
                 payload_data: dict[str, Any] = {"pii": True}
-                if requested_tag and has_existing_tags_column:
-                    payload_data["tags"] = merge_tags(
-                        parse_resource_tags(row.get("existing_tags")),
-                        requested_tag,
+                if requested_tag_id and has_existing_tags_column:
+                    existing_tags_value = row.get("existing_tag_ids")
+                    if existing_tags_value in (None, ""):
+                        existing_tags_value = row.get("existing_tags")
+                    payload_data["tags"] = append_tag_id(
+                        parse_tag_ids(existing_tags_value),
+                        requested_tag_id,
                     )
                 updates.append({"id": column_id, "data": payload_data})
 
@@ -1358,26 +1426,51 @@ def reviewed_pii_updates(
 
 
 def update_reviewed_pii_columns(
-    client: SecodaClient, csv_path: Path, update_tag: str | None = None
+    client: SecodaClient,
+    csv_path: Path,
+    *,
+    update_tag_id: str | None = None,
+    update_tag_name: str | None = None,
 ) -> int:
-    updates, has_existing_tags_column = reviewed_pii_updates(csv_path, update_tag)
+    updates, has_existing_tags_column = reviewed_pii_updates(csv_path, update_tag_id)
     if not updates:
         print("No newly reviewed PII columns found in the CSV.")
         return 0
 
-    requested_tag = canonical_name(update_tag or "")
-    if requested_tag and not has_existing_tags_column:
-        print(
-            "Warning: CSV does not include existing_tags. "
-            "Skipping tag updates to avoid overwriting existing tags. "
-            "Re-run scan with this script version to enable safe tag append."
-        )
-        for update in updates:
-            update["data"].pop("tags", None)
-
     print(f"\nUpdating {len(updates)} column(s) as PII in Secoda...")
-    if requested_tag and has_existing_tags_column:
-        print(f"Appending tag to updated resources: {requested_tag}")
+    if update_tag_id:
+        if not has_existing_tags_column:
+            print(
+                "CSV does not include existing tag snapshots; fetching current tags from Secoda."
+            )
+        tag_enriched_count = 0
+        for update in updates:
+            resource_id = str(update.get("id", "")).strip()
+            if not resource_id:
+                continue
+            try:
+                current_resource = client.get_resource(resource_id)
+            except SecodaApiError as exc:
+                print(
+                    f"  Warning: could not fetch current tags for resource {resource_id}: {exc}"
+                )
+                continue
+            update["data"]["tags"] = append_tag_id(
+                parse_tag_ids(current_resource.get("tags")),
+                update_tag_id,
+            )
+            tag_enriched_count += 1
+
+        tagged_update_count = sum(
+            1
+            for update in updates
+            if "tags" in update["data"]
+        )
+        print(
+            f"Appending tag to updated resources: {update_tag_name or update_tag_id} "
+            f"({tagged_update_count}/{len(updates)} payloads include tag updates; "
+            f"{tag_enriched_count} fetched from API)"
+        )
 
     updated_count = 0
     for batch in [updates[i : i + 100] for i in range(0, len(updates), 100)]:
@@ -1466,7 +1559,9 @@ def run_one_scan_cycle(
     schema_filter: set[str],
     single_table: str | None,
     scan_types: list[str],
-    update_tag: str | None,
+    update_tag_name: str | None,
+    update_tag_id: str | None,
+    skip_review: bool,
 ) -> int:
     print(
         "Applying filters "
@@ -1499,17 +1594,31 @@ def run_one_scan_cycle(
     print(f"Likely matching columns ({', '.join(scan_types)}): {likely_sensitive_count}")
     print(f"JSON report: {json_path.resolve()}")
     print(f"CSV report:  {csv_path.resolve()}")
-    print("\nOpen the CSV in Excel, review the review_pii column, then save the CSV.")
-    if prompt_yes_no(
-        "Continue and update reviewed PII columns now?", default_yes=False
-    ):
-        input("Press Enter after you have saved the reviewed CSV...")
+    if skip_review:
+        print(
+            "\nSkipping manual CSV review (--skip-review enabled). "
+            "Applying updates using current review_pii values."
+        )
         updated_count = update_reviewed_pii_columns(
             client,
             csv_path,
-            update_tag=update_tag,
+            update_tag_id=update_tag_id,
+            update_tag_name=update_tag_name,
         )
         print(f"Updated {updated_count} newly marked PII column(s).")
+    else:
+        print("\nOpen the CSV in Excel, review the review_pii column, then save the CSV.")
+        if prompt_yes_no(
+            "Continue and update reviewed PII columns now?", default_yes=False
+        ):
+            input("Press Enter after you have saved the reviewed CSV...")
+            updated_count = update_reviewed_pii_columns(
+                client,
+                csv_path,
+                update_tag_id=update_tag_id,
+                update_tag_name=update_tag_name,
+            )
+            print(f"Updated {updated_count} newly marked PII column(s).")
 
     return likely_sensitive_count
 
@@ -1622,7 +1731,15 @@ def main() -> int:
         default=None,
         help=(
             "Optional tag to append to each newly updated resource, "
-            'for example: "AI Generated".'
+            'for example: "AI Generated". If omitted, you will be prompted during setup.'
+        ),
+    )
+    parser.add_argument(
+        "--skip-review",
+        action="store_true",
+        help=(
+            "Skip manual CSV review and apply updates immediately. "
+            "Default: false."
         ),
     )
     args, _ = parser.parse_known_args()
@@ -1642,12 +1759,34 @@ def main() -> int:
         print("Using HARDCODED_API_KEY from script.")
 
     client = SecodaClient(base_url=base_url, api_key=api_key)
+    if args.update_tag is None:
+        update_tag_name = canonical_name(
+            prompt_optional_input(
+                'Optional tag to append on updated resources (for example "AI Generated")'
+            )
+        )
+    else:
+        update_tag_name = canonical_name(args.update_tag)
+
+    update_tag_id = ""
+    if update_tag_name:
+        try:
+            update_tag_id, created_tag = resolve_or_create_tag_id(client, update_tag_name)
+        except SecodaApiError as exc:
+            print(f"\nError resolving update tag '{update_tag_name}': {exc}")
+            return 1
+        if created_tag:
+            print(f"Created tag '{update_tag_name}' ({update_tag_id})")
+        else:
+            print(f"Using existing tag '{update_tag_name}' ({update_tag_id})")
+
     if args.review_csv:
         try:
             updated_count = update_reviewed_pii_columns(
                 client,
                 args.review_csv,
-                update_tag=args.update_tag,
+                update_tag_id=update_tag_id or None,
+                update_tag_name=update_tag_name or None,
             )
             print(f"Updated {updated_count} newly marked PII column(s).")
             return 0
@@ -1711,7 +1850,9 @@ def main() -> int:
             schema_filter=schema_filter,
             single_table=single_table,
             scan_types=scan_types,
-            update_tag=args.update_tag,
+            update_tag_name=update_tag_name or None,
+            update_tag_id=update_tag_id or None,
+            skip_review=args.skip_review,
         )
         return 0
     except KeyboardInterrupt:
